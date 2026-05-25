@@ -25,15 +25,27 @@ class RobloxClient:
 
     async def _get_json(self, url: str, params: dict | None = None) -> dict | None:
         async with self.sem:
-            try:
-                async with self.session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=15)) as r:
-                    if r.status != 200:
+            for attempt in range(3):
+                try:
+                    async with self.session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=15)) as r:
+                        if r.status == 200:
+                            return await r.json()
+                        if r.status == 429:
+                            # Honor Retry-After when provided, else exponential
+                            retry = r.headers.get("Retry-After")
+                            try:
+                                wait = float(retry) if retry else (0.75 * (attempt + 1))
+                            except ValueError:
+                                wait = 0.75 * (attempt + 1)
+                            wait = min(wait, 5.0)
+                            await asyncio.sleep(wait)
+                            continue
                         logger.warning("Roblox GET %s -> %s", url, r.status)
                         return None
-                    return await r.json()
-            except Exception as e:  # noqa: BLE001
-                logger.warning("Roblox GET failed %s: %s", url, e)
-                return None
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("Roblox GET failed %s: %s", url, e)
+                    return None
+            return None
 
     async def search_audio_by_artist(self, artist_name: str, limit: int = 30) -> list[int]:
         """Return list of asset IDs from the Creator Store filtered by artist keyword, most recent first.
