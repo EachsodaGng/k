@@ -234,9 +234,9 @@ class RobloxArtistBot(discord.Client):
         for asset in reversed(ordered):
             ok = await self.process_and_post(channel, asset, artist_name)
             aid = asset.get("asset", {}).get("id")
-            if aid:
+            if ok and aid:
+                # Only mark processed on success so transient failures retry next cycle
                 await self.mark_processed(guild_id, artist_key, int(aid))
-            if ok:
                 posted += 1
         return posted
 
