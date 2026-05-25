@@ -220,36 +220,100 @@ class RobloxArtistBot(discord.Client):
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
+    async def scan_artist_group(self, artist_key: str, artist_name: str,
+                                guild_channels: list[tuple[str, str]], limit: int) -> int:
+        """Run search+details ONCE for an artist, then post to each (guild, channel) target.
+
+        Returns total posts across all guilds.
+        """
+        ids = await self.roblox.search_audio_by_artist(artist_name, limit=limit)
+        logger.info("scanG[%s] search=%d ids", artist_name, len(ids))
+        if not ids:
+            return 0
+
+        # Determine which guilds need any of these IDs
+        any_unseen = {}  # guild_id -> set of unseen ids
+        union_unseen: set[int] = set()
+        for g, _ch in guild_channels:
+            u = await self.filter_unseen(g, artist_key, ids)
+            if u:
+                any_unseen[g] = set(u)
+                union_unseen.update(u)
+        if not union_unseen:
+            return 0
+
+        # Fetch details once for the union of unseen IDs across guilds
+        details = await self.roblox.get_audio_details(list(union_unseen))
+        target = artist_key
+        details = [
+            d for d in details
+            if ((d.get("asset") or {}).get("audioDetails") or {}).get("artist", "").strip().lower() == target
+        ]
+        by_id = {d.get("asset", {}).get("id"): d for d in details}
+        logger.info("scanG[%s] union_unseen=%d strict_matches=%d", artist_name, len(union_unseen), len(by_id))
+        if not by_id:
+            return 0
+
+        total_posted = 0
+        for guild_id, channel_id in guild_channels:
+            g_unseen = any_unseen.get(guild_id, set())
+            ordered = [by_id[i] for i in ids if i in by_id and i in g_unseen]
+            if not ordered:
+                continue
+            channel = self.get_channel(int(channel_id))
+            if channel is None:
+                try:
+                    channel = await self.fetch_channel(int(channel_id))
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("scanG[%s] channel %s inaccessible: %s", artist_name, channel_id, e)
+                    continue
+
+            pipeline_sem = asyncio.Semaphore(6)
+
+            async def _one(asset, gid=guild_id, akey=artist_key, ch=channel):
+                async with pipeline_sem:
+                    ok = await self.process_and_post(ch, asset, artist_name)
+                    aid = (asset.get("asset") or {}).get("id")
+                    if ok and aid:
+                        await self.mark_processed(gid, akey, int(aid))
+                    return 1 if ok else 0
+
+            results = await asyncio.gather(*[_one(a) for a in reversed(ordered)], return_exceptions=True)
+            total_posted += sum(r for r in results if isinstance(r, int))
+        return total_posted
+
     async def scan_artist(self, guild_id: str, artist_name: str, channel_id: str,
                           limit: int, announce_summary: discord.abc.Messageable | None = None) -> int:
         """Scan an artist's most-recent audios, post any not yet processed."""
         artist_key = artist_name.lower()
         ids = await self.roblox.search_audio_by_artist(artist_name, limit=limit)
+        logger.info("scan[%s] search returned %d ids", artist_name, len(ids))
         if not ids:
             if announce_summary:
                 await announce_summary.send(f"No audios found on Roblox for **{artist_name}**.")
             return 0
 
-        # Filter unseen
-        unseen: list[int] = []
-        for aid in ids:
-            if not await self.is_processed(guild_id, artist_key, aid):
-                unseen.append(aid)
+        # Bulk unseen check (one query)
+        unseen = await self.filter_unseen(guild_id, artist_key, ids)
+        logger.info("scan[%s] unseen=%d/%d", artist_name, len(unseen), len(ids))
         if not unseen:
             if announce_summary:
                 await announce_summary.send(f"Already up to date for **{artist_name}** ({len(ids)} audios checked).")
             return 0
 
         details = await self.roblox.get_audio_details(unseen)
+        logger.info("scan[%s] details=%d", artist_name, len(details))
         # Strict artist filter (keyword search can hit titles/descriptions too)
         target = artist_key
         details = [
             d for d in details
             if ((d.get("asset") or {}).get("audioDetails") or {}).get("artist", "").strip().lower() == target
         ]
+        logger.info("scan[%s] after strict-artist filter=%d", artist_name, len(details))
         # Match details by id (preserve "recent-first" order from search)
         by_id = {d.get("asset", {}).get("id"): d for d in details}
         ordered = [by_id[i] for i in unseen if i in by_id]
+        logger.info("scan[%s] ordered=%d (about to fetch channel %s)", artist_name, len(ordered), channel_id)
 
         if not ordered:
             if announce_summary:
@@ -263,9 +327,10 @@ class RobloxArtistBot(discord.Client):
         if channel is None:
             try:
                 channel = await self.fetch_channel(int(channel_id))
-            except Exception:  # noqa: BLE001
-                logger.warning("Channel %s not accessible", channel_id)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("scan[%s] Channel %s not accessible: %s", artist_name, channel_id, e)
                 return 0
+        logger.info("scan[%s] posting %d audios to #%s", artist_name, len(ordered), getattr(channel, 'name', channel_id))
 
         # Process audios in parallel (download + ffmpeg + Discord post)
         # _post_sem already caps Discord side; here we cap full pipeline to avoid ffmpeg storms.
@@ -287,19 +352,34 @@ class RobloxArtistBot(discord.Client):
     async def poll_loop(self):
         await self.wait_until_ready()
         logger.info("Polling loop started, interval=%ss", self.poll_interval)
+        poll_lane = asyncio.Semaphore(6)
+
         while not self.is_closed():
             try:
                 monitors = await self.db.monitors.find({}, {"_id": 0}).to_list(length=10000)
-                if monitors:
-                    # Fan out one task per monitor; RobloxClient semaphore caps concurrency
-                    tasks = [
-                        self.scan_artist(m["guild_id"], m["artist_name"], m["channel_id"], POLL_PAGE_LIMIT)
-                        for m in monitors
-                    ]
-                    results = await asyncio.gather(*tasks, return_exceptions=True)
-                    new_total = sum(r for r in results if isinstance(r, int))
-                    if new_total:
-                        logger.info("Poll cycle: %d new audios across %d monitors", new_total, len(monitors))
+                # Group by artist_key so we hit Roblox APIs once per artist (not once per guild)
+                groups: dict[str, dict] = {}
+                for m in monitors:
+                    g = groups.setdefault(m["artist_key"], {"name": m["artist_name"], "targets": []})
+                    g["targets"].append((m["guild_id"], m["channel_id"]))
+                # Process newest-added monitors first by sorting groups by max added_at desc
+                # (approximated by recent-monitor count not tracked here; iterate in insertion order)
+                items = list(groups.items())
+
+                async def _scan_group(item):
+                    key, info = item
+                    async with poll_lane:
+                        try:
+                            return await self.scan_artist_group(key, info["name"], info["targets"], POLL_PAGE_LIMIT)
+                        except Exception as e:  # noqa: BLE001
+                            logger.warning("scan_artist_group[%s] failed: %s", info["name"], e)
+                            return 0
+
+                results = await asyncio.gather(*[_scan_group(it) for it in items], return_exceptions=True)
+                new_total = sum(r for r in results if isinstance(r, int))
+                if new_total:
+                    logger.info("Poll cycle: %d new audios across %d artists (%d monitor rows)",
+                                new_total, len(items), len(monitors))
             except Exception as e:  # noqa: BLE001
                 logger.exception("poll cycle error: %s", e)
             await asyncio.sleep(self.poll_interval)
