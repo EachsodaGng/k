@@ -141,9 +141,22 @@ class RobloxArtistBot(discord.Client):
 
         thumb_task = asyncio.create_task(self.roblox.get_thumbnail_url(asset_id))
         ogg_bytes = await self.roblox.download_audio(asset_id)
-        if not ogg_bytes:
-            logger.warning("Skip post: download failed for %s", asset_id)
+        if ogg_bytes is None:
+            # Transient failure → don't post, caller will not mark processed → retry next cycle
+            logger.warning("Skip post: transient download failure for %s", asset_id)
+            try:
+                await thumb_task
+            except Exception:  # noqa: BLE001
+                pass
             return False
+        if ogg_bytes == b"":
+            # Permanent failure (restricted/deleted) → return "ok" so caller marks as processed
+            logger.info("Permanent-skip restricted asset %s", asset_id)
+            try:
+                await thumb_task
+            except Exception:  # noqa: BLE001
+                pass
+            return True
 
         tmp = make_tmp_dir()
         try:
@@ -217,9 +230,23 @@ class RobloxArtistBot(discord.Client):
             return 0
 
         details = await self.roblox.get_audio_details(unseen)
+        # Strict artist filter (keyword search can hit titles/descriptions too)
+        target = artist_key
+        details = [
+            d for d in details
+            if ((d.get("asset") or {}).get("audioDetails") or {}).get("artist", "").strip().lower() == target
+        ]
         # Match details by id (preserve "recent-first" order from search)
         by_id = {d.get("asset", {}).get("id"): d for d in details}
         ordered = [by_id[i] for i in unseen if i in by_id]
+
+        if not ordered:
+            if announce_summary:
+                await announce_summary.send(
+                    f"Found {len(ids)} keyword match(es) for **{artist_name}** but none have that exact artist tag. "
+                    f"Check the exact spelling on create.roblox.com/store/audio?artistName={artist_name}."
+                )
+            return 0
 
         channel = self.get_channel(int(channel_id))
         if channel is None:

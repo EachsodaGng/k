@@ -36,9 +36,13 @@ class RobloxClient:
                 return None
 
     async def search_audio_by_artist(self, artist_name: str, limit: int = 30) -> list[int]:
-        """Return list of asset IDs from the Creator Store filtered by artistName, most recent first."""
+        """Return list of asset IDs from the Creator Store filtered by artist keyword, most recent first.
+
+        Note: the toolbox-service endpoint ignores `artistName` and only accepts `keyword`.
+        Keyword can match title or description too, so callers must re-filter via details.
+        """
         params = {
-            "artistName": artist_name,
+            "keyword": artist_name,
             "limit": str(limit),
             "sortType": str(DEFAULT_SORT),
         }
@@ -82,7 +86,11 @@ class RobloxClient:
         return url
 
     async def download_audio(self, asset_id: int) -> Optional[bytes]:
-        """Download raw OGG bytes via assetdelivery (follows the CDN redirect)."""
+        """Download raw OGG bytes via assetdelivery (follows the CDN redirect).
+
+        Returns bytes on success, b"" (empty) on permanent failure (401/403/404 → asset restricted/deleted),
+        None on transient failure (timeout / 5xx) so the caller can retry next cycle.
+        """
         async with self.sem:
             try:
                 async with self.session.get(
@@ -91,10 +99,13 @@ class RobloxClient:
                     allow_redirects=True,
                     timeout=aiohttp.ClientTimeout(total=60),
                 ) as r:
-                    if r.status != 200:
-                        logger.warning("download_audio %s -> %s", asset_id, r.status)
-                        return None
-                    return await r.read()
+                    if r.status == 200:
+                        return await r.read()
+                    if r.status in (401, 403, 404, 410):
+                        logger.warning("download_audio %s -> %s (permanent skip)", asset_id, r.status)
+                        return b""
+                    logger.warning("download_audio %s -> %s (will retry)", asset_id, r.status)
+                    return None
             except Exception as e:  # noqa: BLE001
                 logger.warning("download_audio failed %s: %s", asset_id, e)
                 return None
