@@ -122,6 +122,17 @@ class RobloxArtistBot(discord.Client):
         )
         return doc is not None
 
+    async def filter_unseen(self, guild_id: str, artist_key: str, asset_ids: list[int]) -> list[int]:
+        """Bulk-check which asset IDs are NOT yet processed. Preserves input order."""
+        if not asset_ids:
+            return []
+        cur = self.db.processed.find(
+            {"guild_id": guild_id, "artist_key": artist_key, "asset_id": {"$in": asset_ids}},
+            {"_id": 0, "asset_id": 1},
+        )
+        seen = {d["asset_id"] async for d in cur}
+        return [a for a in asset_ids if a not in seen]
+
     # ---------------- Core processing ----------------
 
     async def process_and_post(self, channel: discord.abc.Messageable, asset: dict, artist_query: str) -> bool:
@@ -256,15 +267,21 @@ class RobloxArtistBot(discord.Client):
                 logger.warning("Channel %s not accessible", channel_id)
                 return 0
 
+        # Process audios in parallel (download + ffmpeg + Discord post)
+        # _post_sem already caps Discord side; here we cap full pipeline to avoid ffmpeg storms.
+        pipeline_sem = asyncio.Semaphore(6)
+
+        async def _one(asset):
+            async with pipeline_sem:
+                ok = await self.process_and_post(channel, asset, artist_name)
+                aid = (asset.get("asset") or {}).get("id")
+                if ok and aid:
+                    await self.mark_processed(guild_id, artist_key, int(aid))
+                return 1 if ok else 0
+
         # Post oldest-of-new first so newest ends up last in chat
-        posted = 0
-        for asset in reversed(ordered):
-            ok = await self.process_and_post(channel, asset, artist_name)
-            aid = asset.get("asset", {}).get("id")
-            if ok and aid:
-                # Only mark processed on success so transient failures retry next cycle
-                await self.mark_processed(guild_id, artist_key, int(aid))
-                posted += 1
+        results = await asyncio.gather(*[_one(a) for a in reversed(ordered)], return_exceptions=True)
+        posted = sum(r for r in results if isinstance(r, int))
         return posted
 
     async def poll_loop(self):
